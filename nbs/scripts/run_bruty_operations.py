@@ -188,6 +188,42 @@ def launch_combine(root_path, view_pk_id, config_pth, use_navigation_flag=True, 
     return proc.pid, script_path
 
 
+def create_bruty_manager_status(config):
+    conn_info = connect_params_from_config(config)
+    conn_info.database = config.get('export_database')
+    connection, cursor = connection_with_retries(conn_info)
+
+    cursor.execute(
+        """
+        INSERT INTO public.bruty_status_dev
+        (
+            description,
+            request_exit,
+            enc_request_pause,
+            is_paused,
+            pid,
+            parent_pid,
+            host,
+            progress
+        )
+        VALUES (%s, FALSE, FALSE, FALSE, %s, NULL, %s, NULL)
+        RETURNING status_id
+        """,
+        (
+            "Bruty Manager",
+            os.getpid(),
+            platform.node()
+        )
+    )
+
+    status_id = cursor.fetchone()[0]
+
+    connection.commit()
+    connection.close()
+
+    return status_id
+
+
 def create_bruty_status(config, tile_info, worker_pid):
     """
        Create a status record for a running Bruty operation.
@@ -285,7 +321,6 @@ def create_bruty_status(config, tile_info, worker_pid):
         cursor.close()
         connection.close()
 
-
 # attribute(@feature, 'combine_start_time') is not NULL and ((attribute(@feature, 'combine_start_time') > attribute(@feature, 'combine_end_time')) or ((attribute(@feature, 'combine_start_time') is not NULL and attribute(@feature, 'combine_end_time') is NULL)))
 def remove_finished_processes(tile_processes, tile_manager, config):
     for key in list(tile_processes.keys()):
@@ -307,6 +342,56 @@ def remove_finished_processes(tile_processes, tile_manager, config):
             except KeyError:
                 pass  # the records will disappear from the manager when refreshed from postgres and the code sees it was running
             del tile_processes[key]  # remove the instance from our list of active processes
+
+
+def cleanup_orphaned_bruty_status(config):
+    """
+    Remove status rows for Bruty worker processes that are no longer running
+    Parameters
+    ----------
+    config
+
+    Returns
+    -------
+
+    """
+    conn_info = connect_params_from_config(config)
+    conn_info.database = config.get('export_database')
+    connection, cursor = connection_with_retries(conn_info)
+
+    try:
+        cursor.execute(
+            """
+            SELECT status_id, pid
+            FROM public.bruty_status_dev
+            """
+            )
+        rows = cursor.fetchall()
+
+        for status_id, pid in rows:
+            if pid is None:
+                continue
+
+            # Does the process still exist? remove if no
+            if not psutil.pid_exists(pid):
+                LOGGER.info(
+                    f"Removing orphaned Bruty status row"
+                    f"status_id ={status_id}, pid={pid}"
+                )
+                cursor.execute(
+                    """
+                    DELETE FROM public.bruty_status_dev
+                    WHERE status_id = %s
+                    """,
+                    (status_id,)
+                )
+
+    except Exception:
+        LOGGER.exception("Failed while cleaning orphaned Bruty status rows")
+        raise
+    finally:
+        cursor.close()
+        connection.close()
 
 
 def remove_bruty_status(config, status_id):
@@ -474,6 +559,7 @@ def main(config):
     -------
 
     """
+    manager_status_id = create_bruty_manager_status(config)
 
     quitter = False
     debug_config = config.getboolean('DEBUG', False)
@@ -502,6 +588,7 @@ def main(config):
     tile_manager = TileManager(config, max_tries, allow_res=debug_config)
     tile_processes = {}
 
+
     try:
         check_need_combine = True
         check_need_export = True
@@ -518,6 +605,8 @@ def main(config):
             #     tile_processes[next_tile.hash_id()] = TileProcess(None, next_tile, 1)
             # print(tile_processes)
             # raise
+            cleanup_orphaned_bruty_status(config)
+
             all_priorities = list(tile_manager.priorities.keys())
             # we will try to restart tiles that say they are running in case they crashed without filling the end_time field (meaning they are not actually running)
             if all_priorities == [tile_manager.RUNNING_PRIORITY] or (is_service and not all_priorities):
