@@ -321,6 +321,29 @@ def create_bruty_status(config, tile_info, worker_pid):
         cursor.close()
         connection.close()
 
+
+def get_request_exit(config, pid):
+    conn_info = connect_params_from_config(config)
+    conn_info.database = config.get('export_database')
+
+    connection, cursor = connection_with_retries(conn_info)
+
+    cursor.execute(
+        """
+        SELECT request_exit
+        FROM public.bruty_status_dev
+        WHERE pid = %s
+        """,
+        (pid,)
+    )
+
+    row = cursor.fetchone()
+
+    cursor.close()
+    connection.close()
+
+    return False if row is None else row[0]
+
 # attribute(@feature, 'combine_start_time') is not NULL and ((attribute(@feature, 'combine_start_time') > attribute(@feature, 'combine_end_time')) or ((attribute(@feature, 'combine_start_time') is not NULL and attribute(@feature, 'combine_end_time') is NULL)))
 def remove_finished_processes(tile_processes, tile_manager, config):
     for key in list(tile_processes.keys()):
@@ -560,6 +583,7 @@ def main(config):
 
     """
     manager_status_id = create_bruty_manager_status(config)
+    manager_pid = os.getpid()
 
     quitter = False
     debug_config = config.getboolean('DEBUG', False)
@@ -606,6 +630,21 @@ def main(config):
             # print(tile_processes)
             # raise
             cleanup_orphaned_bruty_status(config)
+
+            request_exit = get_request_exit(config, manager_pid)
+
+            if request_exit:
+                remove_finished_processes(tile_processes, tile_manager, config)
+
+                if not tile_processes:
+                    LOGGER.info(f"Bruty manager exit requested, PID {manager_pid}. All active processes have finished.")
+                    break
+
+                # So manager remains responsive while it waits for workers to finish.
+                do_keyboard_actions(tile_manager, tile_processes)
+                time.sleep(2)
+                # If request_exit is TRUE and workers still exist, the manager does not proceed to all_priorities
+                continue
 
             all_priorities = list(tile_manager.priorities.keys())
             # we will try to restart tiles that say they are running in case they crashed without filling the end_time field (meaning they are not actually running)
@@ -696,6 +735,9 @@ def main(config):
         print(msg)
         LOGGER.error(traceback.format_exc())
         LOGGER.error(msg)
+
+    finally:
+        remove_bruty_status(config, manager_status_id)
 
 
 if __name__ == '__main__':
