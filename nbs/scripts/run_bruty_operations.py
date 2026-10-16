@@ -32,8 +32,10 @@ from nbs.scripts.combine import process_nbs_database, SUCCEEDED, TILE_LOCKED, UN
     perform_qc_checks
 from nbs.bruty.tile_export import combine_and_export
 from nbs.debugging import get_call_logger, setup_call_logger, log_calls
+from nbs.scripts.bruty_status_process_controls import get_enc_request_pause, update_is_paused
 
-interactive_debug = True
+
+interactive_debug = False # change back to True later
 if interactive_debug and sys.gettrace() is None:  # this only is set when a debugger is run (?)
     interactive_debug = False
 debug_launch = False
@@ -116,20 +118,15 @@ def start_process(args, env_path=r'', env_name='', minimized=False, always_exit=
 
 def launch_export(config_path, tile_info, use_caches=False,
                   env_path=r'D:\languages\miniconda3\Scripts\activate', env_name='NBS', profile_tile_id=(0, 0),
-                  minimized=False, fingerprint="", always_exit=False, console_capture="", status_dev_mode=False):
+                  minimized=False, fingerprint="", always_exit=False, console_capture=""):
     # spawn a new console, activate a python environment and run the combine.py script with appropriate arguments
     # FIXME - hack overriding nbs and bruty paths
     # looks like activate is overwriting the pythonpath, so specify it after the activate command
     args = ['python']
     # if profiling:
     #     args.extend(["-m", "cProfile", "-o", str(pathlib.Path(config_path).parent) + f"\\timing{tile_info.tile}_{tile_info.resolution}.profile"])
-
-    if status_dev_mode:
-        script_dir = nbs.scripts.__path__._path[0]
-        script_path = os.path.join(script_dir, "gail_bruty_status_test.py")
-    else:
-        bruty_code = nbs.bruty.__path__._path[0]
-        script_path = os.path.join(bruty_code, "tile_export.py")
+    bruty_code = nbs.bruty.__path__._path[0]
+    script_path = os.path.join(bruty_code, "tile_export.py")
     args.extend([script_path, "-c", config_path, "-k", str(tile_info.pk)])
     if fingerprint:
         args.extend(['-f', fingerprint])
@@ -160,7 +157,7 @@ def launch_combine(root_path, view_pk_id, config_pth, use_navigation_flag=True, 
     # spawn a new console, activate a python environment and run the combine.py script with appropriate arguments
 
     script_dir = nbs.scripts.__path__._path[0]
-    script_path = os.path.join(script_dir, "gail_bruty_status_test.py")  # was using "combine.py" before
+    script_path = os.path.join(script_dir, "gail_bruty_status_test.py")  # swap with combine.py in prod
     args = ['python', script_path]
     for exclusion in exclude:
         args.extend(['-x', exclusion])
@@ -195,7 +192,7 @@ def create_bruty_manager_status(config):
 
     cursor.execute(
         """
-        INSERT INTO public.bruty_status_dev
+        INSERT INTO public.bruty_status
         (
             description,
             request_exit,
@@ -230,7 +227,7 @@ def create_bruty_status(config, tile_info, worker_pid):
 
        Determines the appropriate tile, resolution, and combine IDs from
        the supplied TileInfo object, then inserts a row into
-       public.bruty_status_dev.
+       public.bruty_status.
 
        Combine operations populate tile_id, res_id, and combine_id.
        Export operations populate tile_id and res_id with combine_id set
@@ -254,12 +251,14 @@ def create_bruty_status(config, tile_info, worker_pid):
     try:
 
         if isinstance(tile_info, CombineTileInfo):
+            description = "Combine"
 
             cursor.execute(
                 """
-                INSERT INTO public.bruty_status_dev
-                (tile_id, res_id, combine_id, pid, parent_pid, progress, host)
+                INSERT INTO public.bruty_status
+                (description, tile_id, res_id, combine_id, pid, parent_pid, progress, host)
                 SELECT
+                    %s, -- description
                     r.tile_id, -- tile_id
                     c.res_id, -- res_id
                     c.c_id, -- combine_id
@@ -274,6 +273,7 @@ def create_bruty_status(config, tile_info, worker_pid):
                 RETURNING status_id    
                 """,
                 (
+                    description,
                     worker_pid,  # pid
                     os.getpid(),  # parent_pid
                     0.0,  # progress
@@ -282,11 +282,13 @@ def create_bruty_status(config, tile_info, worker_pid):
                 )
             )
         elif isinstance(tile_info, ResolutionTileInfo):
+            description = "Export"
             cursor.execute(
                     """
-                    INSERT INTO public.bruty_status_dev
-                    (tile_id, res_id, combine_id, pid, parent_pid, progress, host)
+                    INSERT INTO public.bruty_status
+                    (description, tile_id, res_id, combine_id, pid, parent_pid, progress, host)
                     SELECT
+                        %s, -- description
                         r.tile_id, -- tile_id
                         r.r_id, -- res_id
                         NULL, -- combine_id
@@ -296,9 +298,10 @@ def create_bruty_status(config, tile_info, worker_pid):
                         %s  -- host
                     FROM public.spec_resolutions r
                     WHERE r.r_id = %s -- res_id
-                    RETURNING status_id    
+                    RETURNING status_id
                     """,
                     (
+                        description,
                         worker_pid,
                         os.getpid(),
                         0.0,
@@ -331,7 +334,7 @@ def get_request_exit(config, pid):
     cursor.execute(
         """
         SELECT request_exit
-        FROM public.bruty_status_dev
+        FROM public.bruty_status
         WHERE pid = %s
         """,
         (pid,)
@@ -358,6 +361,7 @@ def remove_finished_processes(tile_processes, tile_manager, config):
             # NEW : removing from bruty status table on process completion
             if tracked_process.status_id is not None:
                 # Removing the status record once its associated worker has exited.
+                LOGGER.info(f"Worker has exited, removing the status record status_id={tracked_process.status_id}.")
                 remove_bruty_status(config, tracked_process.status_id)
 
             try:
@@ -381,29 +385,35 @@ def cleanup_orphaned_bruty_status(config):
     conn_info = connect_params_from_config(config)
     conn_info.database = config.get('export_database')
     connection, cursor = connection_with_retries(conn_info)
+    current_host = platform.node()
 
     try:
         cursor.execute(
             """
-            SELECT status_id, pid
-            FROM public.bruty_status_dev
+            SELECT status_id, pid, host
+            FROM public.bruty_status
             """
             )
         rows = cursor.fetchall()
 
-        for status_id, pid in rows:
+        for status_id, pid, host in rows:
             if pid is None:
                 continue
 
+            # Only check processes that belong to this machine.
+            if host != current_host:
+                continue
+
             # Does the process still exist? remove if no
+            # @TODO CHECK FOR HOST
             if not psutil.pid_exists(pid):
                 LOGGER.info(
-                    f"Removing orphaned Bruty status row"
-                    f"status_id ={status_id}, pid={pid}"
+                    f"Removing orphaned Bruty status row "
+                    f"status_id={status_id}, pid={pid}, host={host}"
                 )
                 cursor.execute(
                     """
-                    DELETE FROM public.bruty_status_dev
+                    DELETE FROM public.bruty_status
                     WHERE status_id = %s
                     """,
                     (status_id,)
@@ -421,7 +431,7 @@ def remove_bruty_status(config, status_id):
     """
     Remove a completed Bruty operation from the status table.
 
-    Deletes the row in public.bruty_status_dev associated with the
+    Deletes the row in public.bruty_status associated with the
     supplied status_id. This is called after the corresponding worker
     process has finished.
 
@@ -437,7 +447,7 @@ def remove_bruty_status(config, status_id):
     try:
         cursor.execute(
             """
-            DELETE FROM public.bruty_status_dev
+            DELETE FROM public.bruty_status
             WHERE status_id = %s
             """,
             (status_id,)
@@ -470,7 +480,7 @@ class TileRuns:
     count: int
 
 
-def export_tile(tile_info, config, sql_info, console_capture="", status_dev_mode=False):
+def export_tile(tile_info, config, sql_info, console_capture=""):
     use_cached_meta = config.getboolean('USE_CACHED_METADATA', False)
     env_path = config.get('environment_path')
     env_name = config.get('environment_name')
@@ -489,7 +499,7 @@ def export_tile(tile_info, config, sql_info, console_capture="", status_dev_mode
         pid, script_path = launch_export(config._source_filename, tile_info, use_caches=use_cached_meta,
                                          env_path=env_path, env_name=env_name,
                                          minimized=minimized, fingerprint=fingerprint, always_exit=always_exit,
-                                         console_capture=console_capture, status_dev_mode=status_dev_mode)
+                                         console_capture=console_capture)
         running_process = ConsoleProcessTracker(["python", fingerprint, script_path])
         if running_process.console.last_pid != pid:
             LOGGER.warning(f"Process ID mismatch {pid} did not match the found {running_process.console.last_pid}")
@@ -503,7 +513,7 @@ def export_tile(tile_info, config, sql_info, console_capture="", status_dev_mode
     return return_process
 
 
-def combine_tile(tile_info, config, conn_info, debug_config=False, console_capture="", status_dev_mode=False):
+def combine_tile(tile_info, config, conn_info, debug_config=False, console_capture=""):
     env_path = config.get('environment_path')
     env_name = config.get('environment_name')
     override = config.getboolean('override', False)
@@ -524,7 +534,7 @@ def combine_tile(tile_info, config, conn_info, debug_config=False, console_captu
     conn_info.tablenames = [tile_info.metadata_table_name()]
     fingerprint = str(tile_info.hash_id()) + "_" + datetime.now().isoformat()
     return_process = None
-    if interactive_debug and debug_launch and not status_dev_mode:
+    if interactive_debug and debug_launch:
         if not tile_info.for_nav:
             return None
         setup_call_logger(db_path)
@@ -584,12 +594,13 @@ def main(config):
     """
     manager_status_id = create_bruty_manager_status(config)
     manager_pid = os.getpid()
+    manager_is_paused = False
 
     quitter = False
     debug_config = config.getboolean('DEBUG', False)
     debug_build = config.getboolean('DEBUG_FORCE_BUILD', False)
     is_service = config.getboolean('RUN_AS_SERVICE', False)
-    status_dev_mode = config.getboolean('STATUS_DEV_MODE', False)
+
     # port = config.get('lock_server_port', None)
     use_locks(
         None)  # @ TODO change this to only be using Postgres locks - either row locks on a table or advisory locks
@@ -644,6 +655,31 @@ def main(config):
                 do_keyboard_actions(tile_manager, tile_processes)
                 time.sleep(2)
                 # If request_exit is TRUE and workers still exist, the manager does not proceed to all_priorities
+                continue
+
+            pause_requested = get_enc_request_pause(config, manager_pid)
+
+            # Enter paused state.
+            if pause_requested and not manager_is_paused:
+                update_is_paused(config, manager_pid, True)
+                manager_is_paused = True
+                LOGGER.info(f"Bruty manager pause requested, PID {manager_pid}. "
+                            f"No new processes will be started.")
+
+            # Leave paused state.
+            # Db no longer asking for a pause, but manager still thinks it is currently paused
+            elif not pause_requested and manager_is_paused:
+                update_is_paused(config, manager_pid, False)
+                manager_is_paused = False
+                LOGGER.info(f"Bruty manager pause cleared, PID {manager_pid}. "
+                            f"Resuming process scheduling.")
+
+            # While the manager is paused, don't spawn anything new.
+            if manager_is_paused:
+                remove_finished_processes(tile_processes, tile_manager, config)
+                # Keep manager responsive while paused.
+                do_keyboard_actions(tile_manager, tile_processes)
+                time.sleep(2)
                 continue
 
             all_priorities = list(tile_manager.priorities.keys())
@@ -702,11 +738,10 @@ def main(config):
 
                     if run_combine:
                         returned_process = combine_tile(tile_info, config, conn_info, debug_config=debug_config,
-                                                        console_capture=console_capture,
-                                                        status_dev_mode=status_dev_mode)
+                                                        console_capture=console_capture)
                     elif run_export:
                         returned_process = export_tile(tile_info, config, tile_manager.sql_obj,
-                                                       console_capture=console_capture, status_dev_mode=status_dev_mode)
+                                                       console_capture=console_capture)
                     else:
                         returned_process = None
 

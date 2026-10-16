@@ -19,12 +19,12 @@ $$;
 
 
 DROP TRIGGER IF EXISTS trg_set_enc_request_pause_at
-ON public.bruty_status_dev;
+ON public.bruty_status;
 
 
 CREATE TRIGGER trg_set_enc_request_pause_at
 BEFORE UPDATE OF enc_request_pause
-ON public.bruty_status_dev
+ON public.bruty_status
 FOR EACH ROW
 EXECUTE FUNCTION public.set_enc_request_pause_at();
 
@@ -50,12 +50,12 @@ $$;
 
 
 DROP TRIGGER IF EXISTS trg_set_request_exit_at
-ON public.bruty_status_dev;
+ON public.bruty_status;
 
 
 CREATE TRIGGER trg_set_request_exit_at
 BEFORE UPDATE OF request_exit
-ON public.bruty_status_dev
+ON public.bruty_status
 FOR EACH ROW
 EXECUTE FUNCTION public.set_request_exit_at();
 

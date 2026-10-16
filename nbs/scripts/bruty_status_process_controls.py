@@ -13,7 +13,7 @@ def get_enc_request_pause(config, pid):
     cursor.execute(
         """
         SELECT enc_request_pause
-        FROM public.bruty_status_dev
+        FROM public.bruty_status
         WHERE pid = %s
         """,
         (pid,)
@@ -36,7 +36,7 @@ def update_is_paused(config, pid, is_paused):
     if is_paused:
         cursor.execute(
             """
-            UPDATE public.bruty_status_dev
+            UPDATE public.bruty_status
             SET is_paused = TRUE,
                 is_paused_at = clock_timestamp()
             WHERE pid = %s
@@ -46,7 +46,7 @@ def update_is_paused(config, pid, is_paused):
     else:
         cursor.execute(
             """
-            UPDATE public.bruty_status_dev
+            UPDATE public.bruty_status
             SET is_paused = FALSE
             WHERE pid = %s
             """,
@@ -57,3 +57,23 @@ def update_is_paused(config, pid, is_paused):
     cursor.close()
     connection.close()
 
+def update_progress(config, pid, progress):
+    progress = max(0, min(100, int(progress)))
+
+    conn_info = connect_params_from_config(config)
+    conn_info.database = config.get('export_database')
+
+    connection, cursor = connection_with_retries(conn_info)
+
+    cursor.execute(
+        """
+        UPDATE public.bruty_status
+        SET progress = %s
+        WHERE pid = %s
+        """,
+        (progress, pid)
+    )
+
+    connection.commit()
+    cursor.close()
+    connection.close()
