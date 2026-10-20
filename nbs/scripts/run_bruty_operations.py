@@ -157,7 +157,8 @@ def launch_combine(root_path, view_pk_id, config_pth, use_navigation_flag=True, 
     # spawn a new console, activate a python environment and run the combine.py script with appropriate arguments
 
     script_dir = nbs.scripts.__path__._path[0]
-    script_path = os.path.join(script_dir, "gail_bruty_status_test.py")  # swap with combine.py in prod
+    # swap "combine.py" with fake worker test in dev/debug, i.e gail_bruty_status_test
+    script_path = os.path.join(script_dir, "combine.py")
     args = ['python', script_path]
     for exclusion in exclude:
         args.extend(['-x', exclusion])
@@ -316,9 +317,6 @@ def create_bruty_status(config, tile_info, worker_pid):
         # Keep the database status ID with the tracker process so the
         # corresponding status can be removed when the worker finishes.
         return status_id
-    except Exception:
-        connection.rollback()
-        raise
 
     finally:
         cursor.close()
@@ -331,19 +329,21 @@ def get_request_exit(config, pid):
 
     connection, cursor = connection_with_retries(conn_info)
 
-    cursor.execute(
-        """
-        SELECT request_exit
-        FROM public.bruty_status
-        WHERE pid = %s
-        """,
-        (pid,)
-    )
+    try:
+        cursor.execute(
+            """
+            SELECT request_exit
+            FROM public.bruty_status
+            WHERE pid = %s
+            """,
+            (pid,)
+        )
 
-    row = cursor.fetchone()
+        row = cursor.fetchone()
 
-    cursor.close()
-    connection.close()
+    finally:
+        cursor.close()
+        connection.close()
 
     return False if row is None else row[0]
 
@@ -360,9 +360,12 @@ def remove_finished_processes(tile_processes, tile_manager, config):
 
             # NEW : removing from bruty status table on process completion
             if tracked_process.status_id is not None:
-                # Removing the status record once its associated worker has exited.
-                LOGGER.info(f"Worker has exited, removing the status record status_id={tracked_process.status_id}.")
-                remove_bruty_status(config, tracked_process.status_id)
+                try:
+                    # Removing the status record once its associated worker has exited.
+                    remove_bruty_status(config, tracked_process.status_id)
+                    LOGGER.info(f"Worker has exited, removing the status record status_id={tracked_process.status_id}.")
+                except Exception:
+                    LOGGER.exception("Failed to remove status_id=%s for finished worker", tracked_process.status_id)
 
             try:
                 tile_manager.remove(old_tile)  # remove the tile from the list of tiles to process in the future
@@ -419,6 +422,8 @@ def cleanup_orphaned_bruty_status(config):
                     (status_id,)
                 )
 
+                connection.commit()
+
     except Exception:
         LOGGER.exception("Failed while cleaning orphaned Bruty status rows")
         raise
@@ -456,6 +461,7 @@ def remove_bruty_status(config, status_id):
         connection.commit()
 
     except Exception:
+        LOGGER.exception("Failed to remove Bruty status record: status_id=%s", status_id)
         connection.rollback()
         raise
     finally:
@@ -506,7 +512,13 @@ def export_tile(tile_info, config, sql_info, console_capture=""):
         # print(running_process.console.is_running(), running_process.app.is_running(), running_process.app.last_pid)
 
         #   NEW: Added for bruty status table
-        status_id = create_bruty_status(config, tile_info, running_process.app.last_pid) # worker_id
+        status_id = None
+        try:
+            status_id = create_bruty_status(config, tile_info, running_process.app.last_pid) # worker_id
+
+        except Exception:
+            LOGGER.exception("Failed to create Bruty status for worker PID %s, tile_info=%r",
+                             running_process.app.last_pid, tile_info)
 
         return_process = TileProcess(running_process, tile_info, fingerprint, status_id)
 
@@ -564,10 +576,17 @@ def combine_tile(tile_info, config, conn_info, debug_config=False, console_captu
         # Use the detected worker PID rather than initial launcher
         worker_pid = running_process.app.last_pid
 
-        status_id = create_bruty_status(config, tile_info, worker_pid)
-        print(f"Created Bruty status row: {status_id}")
-        print(f"Worker PID: {worker_pid}")
-        print(f"Parent ID: {os.getpid()}")
+        status_id = None
+
+        try:
+            status_id = create_bruty_status(config, tile_info, worker_pid)
+            print(f"Created Bruty status row: {status_id}")
+            print(f"Worker PID: {worker_pid}")
+            print(f"Parent ID: {os.getpid()}")
+
+        except Exception:
+            LOGGER.exception("Failed to create Bruty status for worker PID %s, tile_info=%r",
+                             worker_pid, tile_info)
 
         # print(running_process.console.is_running(), running_process.app.is_running(), running_process.app.last_pid)
         return_process = TileProcess(running_process, tile_info, fingerprint, status_id)
@@ -640,9 +659,18 @@ def main(config):
             #     tile_processes[next_tile.hash_id()] = TileProcess(None, next_tile, 1)
             # print(tile_processes)
             # raise
-            cleanup_orphaned_bruty_status(config)
+            try:
+                cleanup_orphaned_bruty_status(config)
+            except Exception:
+                LOGGER.exception("Failed to clean up orphaned Bruty status records")
 
-            request_exit = get_request_exit(config, manager_pid)
+            # Handle issues with checking exit status
+            try:
+                request_exit = get_request_exit(config, manager_pid)
+            except Exception:
+                LOGGER.exception("Failed to check Bruty exit request for manager PID %s", manager_pid)
+                time.sleep(2)
+                continue # Skips scheduling new workers during that iteration and retries at the next iteration
 
             if request_exit:
                 remove_finished_processes(tile_processes, tile_manager, config)
