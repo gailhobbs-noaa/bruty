@@ -35,7 +35,7 @@ from nbs.debugging import get_call_logger, setup_call_logger, log_calls
 from nbs.scripts.bruty_status_process_controls import get_enc_request_pause, update_is_paused
 
 
-interactive_debug = False # change back to True later
+interactive_debug = False  # set to False when testing worker subprocesses, PID tracking, or Bruty status records.
 if interactive_debug and sys.gettrace() is None:  # this only is set when a debugger is run (?)
     interactive_debug = False
 debug_launch = False
@@ -126,6 +126,7 @@ def launch_export(config_path, tile_info, use_caches=False,
     # if profiling:
     #     args.extend(["-m", "cProfile", "-o", str(pathlib.Path(config_path).parent) + f"\\timing{tile_info.tile}_{tile_info.resolution}.profile"])
     bruty_code = nbs.bruty.__path__._path[0]
+    # swap "tile_export.py" with fake worker test in dev/debug for bruty status, i.e gail_bruty_status_test.py
     script_path = os.path.join(bruty_code, "tile_export.py")
     args.extend([script_path, "-c", config_path, "-k", str(tile_info.pk)])
     if fingerprint:
@@ -157,7 +158,7 @@ def launch_combine(root_path, view_pk_id, config_pth, use_navigation_flag=True, 
     # spawn a new console, activate a python environment and run the combine.py script with appropriate arguments
 
     script_dir = nbs.scripts.__path__._path[0]
-    # swap "combine.py" with fake worker test in dev/debug, i.e gail_bruty_status_test
+    # swap "combine.py" with fake worker test in dev/debug, i.e gail_bruty_status_test.py
     script_path = os.path.join(script_dir, "combine.py")
     args = ['python', script_path]
     for exclusion in exclude:
