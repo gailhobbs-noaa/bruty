@@ -5,6 +5,7 @@ from contextlib import contextmanager
 
 from nbs.bruty.nbs_postgres import connection_with_retries
 
+
 class BrutyStatusDB:
     """
     Database access for Bruty process status and controls.
@@ -19,7 +20,7 @@ class BrutyStatusDB:
     @contextmanager
     def cursor(self):
         """
-        Open a database connection and cursor.
+        Open a database connection and cursor
 
         Commit successful operations, roll back on errors,
         and always close the cursor and connection.

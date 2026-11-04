@@ -379,13 +379,15 @@ def process_nbs_records(world_db, names_list, sort_dict, comp, transform_metadat
             time.sleep(1)  # when waiting for one locked file this stops it from being a cpu hog
             num_names = len(names_list)
             for i in range(num_names-1, -1, -1):
+                action = user_action()
+
                 # Check the status table if no keyboard quit was requested
                 if action != QUIT and status_db is not None:
                     if status_db.get_request_exit("Combine"):
                         LOGGER.info("Combine exit requested through bruty_status")
                         action = QUIT
 
-                action = user_action()
+
                 if action == QUIT:
                     cancelled = True
                     names_list = []

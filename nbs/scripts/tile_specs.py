@@ -980,6 +980,8 @@ def iterate_combine_table(config, iff_needs_to_process=False, max_retries=3, sql
         info = CombineTileInfo(**review_tile)
 
         # new: check whether this is a new processing request
+        # 1. start_time is None means the combine has never started bc combine hasn't run yet
+        # 2. combine has started before but a new request has been submitted
         new_request = (info.combine.request_time is not None and (info.combine.start_time is None or info.combine.start_time < info.combine.request_time))
 
         # retries after cancellation unless newly requested
