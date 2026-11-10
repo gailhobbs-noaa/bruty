@@ -120,7 +120,7 @@ def launch_export(config_path, tile_info, use_caches=False,
     # if profiling:
     #     args.extend(["-m", "cProfile", "-o", str(pathlib.Path(config_path).parent) + f"\\timing{tile_info.tile}_{tile_info.resolution}.profile"])
     bruty_code = nbs.bruty.__path__._path[0]
-    # swap "tile_export.py" with fake worker test in dev/debug for bruty status, i.e gail_bruty_status_test.py
+    # swap "tile_export.py" with fake worker test in dev/debug for bruty status,
     script_path = os.path.join(bruty_code, "tile_export.py")
     args.extend([script_path, "-c", config_path, "-k", str(tile_info.pk)])
     if fingerprint:
@@ -152,7 +152,7 @@ def launch_combine(root_path, view_pk_id, config_pth, use_navigation_flag=True, 
     # spawn a new console, activate a python environment and run the combine.py script with appropriate arguments
 
     script_dir = nbs.scripts.__path__._path[0]
-    script_path = os.path.join(script_dir, "combine.py") # gail_bruty_status_test.py
+    script_path = os.path.join(script_dir, "combine.py")
     args = ['python', script_path]
     for exclusion in exclude:
         args.extend(['-x', exclusion])
@@ -251,9 +251,10 @@ def create_bruty_status(config, tile_info, worker_pid):
             cursor.execute(
                 """
                 INSERT INTO public.bruty_status
-                (description, tile_id, res_id, combine_id, pid, parent_pid, progress, host)
+                (description, process_start_time, tile_id, res_id, combine_id, pid, parent_pid, progress, host)
                 SELECT
                     %s, -- description
+                    clock_timestamp(),
                     r.tile_id, -- tile_id
                     c.res_id, -- res_id
                     c.c_id, -- combine_id
@@ -281,9 +282,10 @@ def create_bruty_status(config, tile_info, worker_pid):
             cursor.execute(
                     """
                     INSERT INTO public.bruty_status
-                    (description, tile_id, res_id, combine_id, pid, parent_pid, progress, host)
+                    (description, process_start_time, tile_id, res_id, combine_id, pid, parent_pid, progress, host)
                     SELECT
                         %s, -- description
+                        clock_timestamp(),
                         r.tile_id, -- tile_id
                         r.r_id, -- res_id
                         NULL, -- combine_id
@@ -505,18 +507,43 @@ def export_tile(tile_info, config, sql_info, console_capture=""):
         # print(running_process.console.is_running(), running_process.app.is_running(), running_process.app.last_pid)
 
         #   NEW: Added for bruty status table
-        status_id = None
-        try:
-            status_id = create_bruty_status(config, tile_info, running_process.app.last_pid) # worker_id
+        # status_id = None
+        worker_pid = get_worker_pid(running_process)
 
-        except Exception:
-            LOGGER.exception("Failed to create Bruty status for worker PID %s, tile_info=%r",
-                             running_process.app.last_pid, tile_info)
+        status_id = None
+
+        if worker_pid is not None:
+            try:
+                status_id = create_bruty_status(config, tile_info, worker_pid)
+
+            except Exception:
+                LOGGER.exception(
+                    "Failed to create Bruty status for worker PID %s, tile_info=%r",
+                    worker_pid, tile_info
+                )
+        else:
+            LOGGER.warning("Could not detect worker PID for %r", tile_info)
 
         return_process = TileProcess(running_process, tile_info, fingerprint, status_id)
 
     return return_process
 
+
+def get_worker_pid(running_process):
+    """Wait briefly for the Python worker process to become detectable."""
+    worker_pid = running_process.app.last_pid
+
+    for _ in range(20):
+        if worker_pid is not None:
+            break
+
+        time.sleep(0.5)
+        worker_pid = running_process.app.find()
+
+        if worker_pid is not None:
+            running_process.app.last_pid = worker_pid
+
+    return worker_pid
 
 def combine_tile(tile_info, config, conn_info, debug_config=False, console_capture=""):
     env_path = config.get('environment_path')
@@ -560,20 +587,23 @@ def combine_tile(tile_info, config, conn_info, debug_config=False, console_captu
 
         # NEW TEST: create status record for the actual Python worker
         # Use the detected worker PID rather than initial launcher
-        worker_pid = running_process.app.last_pid
+        #worker_pid = running_process.app.last_pid
+        worker_pid = get_worker_pid(running_process)
 
         status_id = None
 
-        try:
-            status_id = create_bruty_status(config, tile_info, worker_pid)
-            print(f"Created Bruty status row: {status_id}")
-            print(f"Worker PID: {worker_pid}")
-            print(f"Parent ID: {os.getpid()}")
+        if worker_pid is not None:
+            try:
+                status_id = create_bruty_status(config, tile_info, worker_pid)
+                print(f"Created Bruty status row: {status_id}")
+                print(f"Worker PID: {worker_pid}")
+                print(f"Parent ID: {os.getpid()}")
 
-        except Exception:
-            LOGGER.exception("Failed to create Bruty status for worker PID %s, tile_info=%r",
+            except Exception:
+                LOGGER.exception("Failed to create Bruty status for worker PID %s, tile_info=%r",
                              worker_pid, tile_info)
-
+        else:
+            LOGGER.warning("Could not detect worker PID for %r", tile_info)
         # print(running_process.console.is_running(), running_process.app.is_running(), running_process.app.last_pid)
         return_process = TileProcess(running_process, tile_info, fingerprint, status_id)
     return return_process
@@ -590,27 +620,6 @@ def reached_max_load(tile_processes, max_processes):
             cnt+=2
     return cnt >= max_processes
 
-
-def get_global_bruty_status_flags(config):
-    conn_info = connect_params_from_config(config)
-    conn_info.database = config.get('export_database')
-    connection, cursor = connection_with_retries(conn_info)
-
-    try:
-        cursor.execute("""
-        SELECT enc_request_pause, request_exit
-        FROM public.bruty_status
-        WHERE status_id = 1
-            AND description = 'Global Bruty'
-        """)
-
-        row = cursor.fetchone()
-
-        return bool(row[0])
-
-    finally:
-        cursor.close()
-        connection.close()
 
 def main(config):
     """
@@ -699,27 +708,33 @@ def main(config):
             pause_requested = get_enc_request_pause(config, manager_status_id) or get_enc_request_pause(config, GLOBAL_BRUTY_STATUS_ID)
 
             # Enter paused state.
-            if pause_requested and not manager_is_paused:
-                update_is_paused(config, manager_status_id, True)
-                manager_is_paused = True
-                LOGGER.info(f"Bruty manager pause requested, PID {manager_pid}. "
-                            f"No new processes will be started.")
-
-            # Leave paused state.
-            # Db no longer asking for a pause, but manager still thinks it is currently paused
-            elif not pause_requested and manager_is_paused:
-                update_is_paused(config, manager_status_id, False)
-                manager_is_paused = False
-                LOGGER.info(f"Bruty manager pause cleared, PID {manager_pid}. "
-                            f"Resuming process scheduling.")
-
-            # While the manager is paused, don't spawn anything new.
-            if manager_is_paused:
+            # Handle pause request.
+            if pause_requested:
+                # Remove workers that have finished.
                 remove_finished_processes(tile_processes, tile_manager, config)
-                # Keep manager responsive while paused.
+
+                # Only acknowledge the pause when all workers have exited.
+                if not tile_processes and not manager_is_paused:
+                    update_is_paused(config, manager_status_id, True)
+                    manager_is_paused = True
+                    LOGGER.info(
+                        f"Bruty manager PID {manager_pid} is fully paused. "
+                        "All active processes have finished."
+                    )
+
+                # Do not schedule new work while a pause is requested.
                 do_keyboard_actions(tile_manager, tile_processes)
                 time.sleep(2)
                 continue
+
+            # Resume when the pause request is cleared.
+            elif manager_is_paused:
+                update_is_paused(config, manager_status_id, False)
+                manager_is_paused = False
+                LOGGER.info(
+                    f"Bruty manager pause cleared, PID {manager_pid}. "
+                    "Resuming process scheduling."
+                )
 
             all_priorities = list(tile_manager.priorities.keys())
             # we will try to restart tiles that say they are running in case they crashed without filling the end_time field (meaning they are not actually running)
