@@ -27,7 +27,7 @@ from nbs.bruty.utils import onerr, user_action, popen_kwargs, ConsoleProcessTrac
 from nbs.configs import get_logger, run_command_line_configs, parse_multiple_values, show_logger_handlers, get_log_level
 from nbs.bruty.nbs_postgres import ENC, connect_params_from_config, connection_with_retries
 from nbs.scripts.tile_specs import TileToProcess, TileProcess, TileManager, ResolutionTileInfo, CombineTileInfo, TileInfo
-from nbs.scripts.combine import process_nbs_database, SUCCEEDED, TILE_LOCKED, UNHANDLED_EXCEPTION, DATA_ERRORS, perform_qc_checks
+from nbs.scripts.combine import process_nbs_database, SUCCEEDED, TILE_LOCKED, UNHANDLED_EXCEPTION, DATA_ERRORS, CANCELLED, perform_qc_checks
 from nbs.bruty.tile_export import combine_and_export
 from nbs.debugging import get_call_logger, setup_call_logger, log_calls
 from nbs.scripts.bruty_status_process_controls import get_enc_request_pause, update_is_paused
@@ -774,7 +774,7 @@ def main(config):
                         combine_tiles = tile_info.get_related_combine_info(tile_manager.sql_obj)
                         run_export = True
                         for tile in combine_tiles:
-                            if tile.combine.needs_processing() or tile.is_locked:
+                            if tile.combine.needs_processing() or tile.combine.exit_code == CANCELLED or tile.is_locked:
                                 run_export = False
                                 if tile.is_locked:
                                     LOGGER.info(f"Delaying export of {tile_info} because {tile} is locked")
