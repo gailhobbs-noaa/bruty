@@ -47,12 +47,20 @@ from fuse_dev.fuse.fuse_processor import git_head_commit_id
 import nbs.scripts.combine
 from nbs.bruty.constants import CONTRIBUTOR_BAND_NAME, ELEVATION_BAND_NAME, UNCERTAINTY_BAND_NAME
 from nbs.bruty.raster_funcs import  raster_band_name_index
-from nbs.scripts.tile_specs import create_world_db, SUCCEEDED, TILE_LOCKED, UNHANDLED_EXCEPTION, DATA_ERRORS, \
+from nbs.scripts.tile_specs import create_world_db, SUCCEEDED, TILE_LOCKED, UNHANDLED_EXCEPTION, DATA_ERRORS, CANCELLED, \
     TileInfo, ResolutionTileInfo, CombineTileInfo
+from nbs.bruty.bruty_status_db import BrutyStatusDB
 
 gdal.DontUseExceptions()
 
 LOGGER = get_logger('nbs.bruty.export')
+
+
+class ExportCancelled(Exception):
+    """Raised when an export receives a graceful exit request."""
+    pass
+
+
 VERSION = (1, 0, 0)
 __version__ = '.'.join(map(str, VERSION))
 DEFAULT_BLOCK_SIZE = 8192  # roughly a gig of memory usage: 16 * 512 (gdal tile size) which when taken as a square of three bands of floats 8192^2 * 3 * 4 = 800MB
@@ -77,7 +85,7 @@ DEFAULT_BLOCK_SIZE = 8192  # roughly a gig of memory usage: 16 * 512 (gdal tile 
 """
 
 # 1) Get tile geometries and attributes
-interactive_debug = False
+interactive_debug = True
 if interactive_debug and sys.gettrace() is None:  # this only is set when a debugger is run (?)
     interactive_debug = False
 
@@ -371,6 +379,18 @@ def get_metadata(combine_tiles, conn_info, use_bruty_cached=False):
 
 
 def combine_and_export(config, tile_info, use_caches=False):
+    # new: intialize bruty status database
+    status_conn_info = connect_params_from_config(config)
+    status_conn_info.database = config.get('export_database')
+    status_db = BrutyStatusDB(status_conn_info)
+
+    # new: helper to detect export cancellation
+    def check_export_cancel():
+        if status_db.get_request_exit("Export"):
+            LOGGER.info(f"Export cancellation requested for {tile_info}")
+            raise ExportCancelled()
+
+
     # conn_info.database = "metadata"
     conn_info_exports = connect_params_from_config(config)
     conn_info_exports.database = config.get('export_database', None)
@@ -406,6 +426,10 @@ def combine_and_export(config, tile_info, use_caches=False):
         tile_info.update_table_record(**{tile_info.export.START_TIME: "clock_timestamp()", tile_info.export.TRIES: f"COALESCE({tile_info.export.TRIES}, 0) + 1",
                                          tile_info.export.DATA_LOCATION: f"'{export_dir}'", tile_info.export.INFO_LOG: info_log,
                                          tile_info.export.WARNINGS_LOG: warnings_log})
+
+        # adding here bc the worker has acquired its locks and recorded its start time. safe point to check whether cancellation was requested
+        check_export_cancel()
+
         # 3) Extract data from all necessary Bruty DBs
         if tile_info.public or tile_info.internal or tile_info.navigation:
             try:
@@ -483,6 +507,11 @@ def combine_and_export(config, tile_info, use_caches=False):
                 if all(done):
                     LOGGER.info(f"Already exported - {timestamp} data located at:")
                     del dataset, dataset_score  # release the file handle for the score file
+
+                    # check cancellation after releasing datasets, before updating xbox records
+                    # this way cleanup is safer
+                    check_export_cancel()
+
                     for exp, loc, exp_rec_id in done:
                         LOGGER.info(f"  {exp}  --  {loc}")
                         needed_tiles = set([tile for tile in combine_tiles if (tile.datatype, tile.for_nav) in export_definitions[exp]['datasets']])
@@ -505,6 +534,9 @@ def combine_and_export(config, tile_info, use_caches=False):
                         add_tiles = needed_tiles - combines_used
                         base_cnt = add_databases(add_tiles, dataset, dataset_score, comp)
                         combines_used.update(add_tiles)
+
+                        # check cancellation before generating and publishing new export products
+                        check_export_cancel()
 
                         if tile_info.navigation:
                             os.makedirs(nav_export.extracted_filename.parent, exist_ok=True)
@@ -590,6 +622,9 @@ def combine_and_export(config, tile_info, use_caches=False):
     except BaseLockException:
         LOGGER.warning(f"Could not get locks for {tile_info}")
         ret_code = TILE_LOCKED
+    except ExportCancelled:
+        LOGGER.info(f"Export cancelled gracefully: {tile_info}")
+        ret_code = CANCELLED
     except Exception as e:
         traceback.print_exc()
         msg = f"{tile_info.full_name} had an unhandled exception - see message above"

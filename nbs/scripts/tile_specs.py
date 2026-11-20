@@ -953,9 +953,15 @@ def get_combine_records(config, needs_to_process=False, get_lock_status=True, ma
 
 def iterate_export_table(config, iff_needs_to_process=False, max_retries=3, sql_info=None):
     records = get_export_records(config, max_retries=max_retries, sql_info=sql_info)
+
     for review_tile in records:
         info = ResolutionTileInfo(**review_tile)
-        if not iff_needs_to_process or (info.export.needs_processing() and (info.export.tries is None or info.export.tries < max_retries)):
+
+        new_request = (info.export.request_time is not None
+                       and (info.export.start_time is None or info.export.start_time < info.export.request_time))
+
+
+        if not iff_needs_to_process or (info.export.needs_processing() and (info.export.tries is None or info.export.tries < max_retries) and (info.export.exit_code != CANCELLED or new_request)):
             yield info
 
 def iterate_combine_table(config, iff_needs_to_process=False, max_retries=3, sql_info=None):
